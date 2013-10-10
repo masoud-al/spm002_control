@@ -34,6 +34,7 @@ class SPM002control():
             indexTmp = self.deviceIndex
             self.closeDevice()
         self.deviceList = []
+        self.serialList = []
         for k in range(15):
             # It seems the first index is not valid... start with 1
             index = c_int(k + 1)
