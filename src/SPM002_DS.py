@@ -154,6 +154,7 @@ class SPM002_DS(PyTango.Device_4Impl):
 
 		self.expTime = 200
 		self.updateTime = 500
+		self.autoExpose = True
 		self.deviceList = []
 
 		while self.get_state() == PyTango.DevState.UNKNOWN:
@@ -235,7 +236,7 @@ class SPM002_DS(PyTango.Device_4Impl):
 			try:
 				attrs = self.get_device_attr()
 				self.expTime = attrs.get_w_attr_by_name('ExposureTime').get_write_value()
-				s = ''.join(('Exposure time ', self.expTime, ' ms'))
+				s = ''.join(('Exposure time ', str(self.expTime), ' ms'))
 				self.info_stream(s)
 			except Exception, e:
 				self.error_stream('Could not retrieve attribute ExposureTime, using default value')
@@ -249,15 +250,28 @@ class SPM002_DS(PyTango.Device_4Impl):
 	
 			try:
 				self.updateTime = attrs.get_w_attr_by_name('UpdateTime').get_write_value()
-				s = ''.join(('Update time ', self.updateTime, ' ms'))
+				s = ''.join(('Update time ', str(self.updateTime), ' ms'))
 				self.info_stream(s)
 			except Exception, e:
 				self.error_stream('Could not retrieve attribute UpdateTime, using default value')
 
+			try:
+				self.autoExpose = attrs.get_w_attr_by_name('AutoExposure').get_write_value()
+				s = ''.join(('Autoexposure ', str(self.autoExpose)))
+				self.info_stream(s)
+			except Exception, e:
+				self.error_stream('Could not retrieve attribute UpdateTime, using default value')
+
+			try:
+				self.spectrometer.closeDevice()
+			except Exception, e:
+				self.error_stream(''.join(('Could not disconnect from spectrometer, ', str(e))))
+			time.sleep(5)  # Wait to let other spectrometers populate their device lists
+			self.openSpectrometer()
+
 			self.set_status('Connected to spectrometer, not acquiring')
 			self.info_stream('Initialization finished.')
 			self.set_state(PyTango.DevState.STANDBY)
-			time.sleep(5)  # Wait to let other spectrometers populate their device lists
 
 
 	def standbyHandler(self, prevState):
@@ -386,29 +400,15 @@ class SPM002_DS(PyTango.Device_4Impl):
 			cmd = self.commandQueue.get(block=False)
 			self.info_stream(str(cmd.command))
 			if cmd.command == 'writeExposureTime':
-				try:
-					self.hardwareLock.acquire()
-					self.spectrometer.setExposureTime(int(cmd.data * 1e3))  # expTime is in ms, the spectrometer excpects us
-					self.expTime = cmd.data
-					self.info_stream(''.join(('New exposure time: ', str(self.expTime))))
-				except Exception, e:
-					self.set_state(PyTango.DevState.FAULT)
-					self.set_status(''.join(('Could not set exposure time', str(e))))
-					self.error_stream(''.join(('Could not set exposure time', str(e))))
-				finally:
-					self.hardwareLock.release()
-				if self.updateTime > self.expTime:
-					self.sleepTime = (self.updateTime - self.expTime) * 1e-3
-				else:
-					self.sleepTime = self.expTime * 1e-3
+				self.expTime = cmd.data
+				self.setExposure(True)
 					
 			elif cmd.command == 'writeUpdateTime':
 				self.updateTime = cmd.data
-				if self.updateTime > self.expTime:
-					self.sleepTime = (self.updateTime - self.expTime) * 1e-3
-				else:
-					self.sleepTime = self.expTime * 1e-3
+				self.setExposure(True)
 
+			elif cmd.command == 'writeAutoExposure':
+				self.autoExpose = cmd.data
 
 			elif cmd.command == 'on':
 				
@@ -424,8 +424,41 @@ class SPM002_DS(PyTango.Device_4Impl):
 		except Queue.Empty:
 			pass
 
-	def setExposure(self):
-		pass
+	def setExposure(self, forceSet=False):
+		self.info_stream('In setExposure: ')
+		if self.autoExpose == True:
+			# We will try to keep the max reading at around nomI counts
+			nomI = 2500.0
+			maxI = np.max(self.spectrumData)
+			# Don't adjust if the intensity is within 10% of nominal	
+			if (nomI / maxI > 1.1) or (nomI / maxI < 0.9): 		
+				newExp = nomI / maxI * self.expTime
+				# Don't adjust to over 500 ms, the update rate would be too slow
+				if newExp > 500:
+					newExp = 500			
+				self.expTime = newExp
+				forceSet = True 
+
+		if forceSet == True:
+			t0 = time.clock()
+			try:
+				self.hardwareLock.acquire()
+				self.spectrometer.setExposureTime(int(self.expTime * 1e3))  # expTime is in ms, the spectrometer excpects us
+				self.info_stream(''.join(('New exposure time: ', str(self.expTime))))
+			except Exception, e:
+				self.set_state(PyTango.DevState.FAULT)
+				self.set_status(''.join(('Could not set exposure time', str(e))))
+				self.error_stream(''.join(('Could not set exposure time', str(e))))
+			finally:
+				self.hardwareLock.release()
+			if self.updateTime > self.expTime:
+				self.sleepTime = (self.updateTime - self.expTime) * 1e-3
+			else:
+				self.sleepTime = self.expTime * 1e-3
+			dt = time.clock() - t0
+			self.info_stream(''.join(('Time to set exposure: ', str(dt))))
+				
+		
 		
 
 	def openSpectrometer(self):
@@ -461,16 +494,24 @@ class SPM002_DS(PyTango.Device_4Impl):
 			# Detect zero crossings to this half max to determine the FWHM
 			halfInd = np.where(np.diff(np.sign(m - halfMax)))[0]
 			halfIndReduced = halfInd[np.abs(halfInd - peakInd).argsort()[0:2]]
-			# Check where the signal is below 1.2*noiseFloor
+			# Check where the signal is below 1.2*noiseFloor:
  			noiseInd = np.where(sp < 1.2 * noiseFloor)[0]
+ 			# Calculate distance to peak:
  			peakDist = abs(noiseInd - peakInd)
+ 			# Index where the peak starts in the vector noiseInd:
  			peakEdge = peakDist.argmin()
+ 			# The peak is then located between [peakEdge - 1] and [peakEdge + 1]: 
  			peakData = sp[noiseInd[peakEdge - 1]:noiseInd[peakEdge + 1]]
  			peakWavelengths = self.wavelengths[noiseInd[peakEdge - 1]:noiseInd[peakEdge + 1]]
 
- 			self.peakEnergy = np.trapz(peakData, peakWavelengths)
+ 			self.peakEnergy = 1560 * 1e-6 * np.trapz(peakData, peakWavelengths) / self.expTime  # Integrate total intensity 			
 			self.spectrumFWHM = np.abs(np.diff(self.wavelengths[halfIndReduced]))
 			self.spectrumCenter = self.wavelengths[peakInd]
+			
+			self.info_stream(''.join(('In calculateSpectrumParameters: PeakEnergy = ', str(self.peakEnergy))))
+			
+			if self.autoExpose == True:
+				self.setExposure()
 
 
 #------------------------------------------------------------------
@@ -543,6 +584,27 @@ class SPM002_DS(PyTango.Device_4Impl):
 		# 	Add your own code here
 		self.commandQueue.put(SpectrometerCommand('writeExposureTime', data))
 
+#------------------------------------------------------------------
+# 	Read AutoExposure attribute
+#------------------------------------------------------------------
+	def read_AutoExposure(self, attr):
+		
+		# 	Add your own code here
+		
+		attr_ExposureTime_read = self.autoExpose
+		attr.set_value(attr_ExposureTime_read)
+
+
+#------------------------------------------------------------------
+# 	Write ExposureTime attribute
+#------------------------------------------------------------------
+	def write_AutoExposure(self, attr):
+		print "In ", self.get_name(), "::write_AutoExposure()"
+		data = attr.get_write_value()
+		print "Attribute value = ", data
+
+		# 	Add your own code here
+		self.commandQueue.put(SpectrometerCommand('writeAutoExposure', data))
 
 #------------------------------------------------------------------
 # 	Read UpdateTime attribute
@@ -833,6 +895,14 @@ class SPM002_DSClass(PyTango.DeviceClass):
 				'description':"Exposure time in ms",
 				'Memorized':"true_without_hard_applied",
 			} ],
+		'AutoExposure':
+			[[PyTango.DevBoolean,
+			PyTango.SCALAR,
+			PyTango.READ_WRITE],
+			{
+				'description':"Set if autoexposure time is to be used",
+				'Memorized':"true_without_hard_applied",
+			} ],
 		'UpdateTime':
 			[[PyTango.DevDouble,
 			PyTango.SCALAR,
@@ -862,6 +932,7 @@ class SPM002_DSClass(PyTango.DeviceClass):
 			PyTango.READ],
 			{
 				'description':"Energy inside the main peak",
+				'unit':'counts*m/s'
 			} ],
 		'Wavelengths':
 			[[PyTango.DevDouble,
