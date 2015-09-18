@@ -93,7 +93,7 @@ class SPM002_DS(PyTango.Device_4Impl):
 		
 		try:
 			self.stopStateThread()
-			self.spectrometer.closeDevice()
+			
 		except Exception, e:
 			pass
 		
@@ -104,7 +104,7 @@ class SPM002_DS(PyTango.Device_4Impl):
 		
 		self.stateHandlerDict = {PyTango.DevState.ON: self.onHandler,
 								PyTango.DevState.STANDBY: self.standbyHandler,
-								PyTango.DevState.ALARM: self.alarmHandler,
+								PyTango.DevState.ALARM: self.onHandler,
 								PyTango.DevState.FAULT: self.faultHandler,
 								PyTango.DevState.INIT: self.initHandler,
 								PyTango.DevState.UNKNOWN: self.unknownHandler,
@@ -115,6 +115,7 @@ class SPM002_DS(PyTango.Device_4Impl):
 		self.stateThread.start()
 		
 		self.hardwareLock = threading.Lock()
+		self.attrLock = threading.Lock()
 		self.stopHardwareThreadFlag = False
 # 		self.hardwareThread = threading.Thread()
 # 		threading.Thread.__init__(self.hardwareThread, target=self.readHardware)
@@ -285,18 +286,22 @@ class SPM002_DS(PyTango.Device_4Impl):
 			self.checkCommands()
 			if self.get_state() != PyTango.DevState.STANDBY:
 				break
-
+						
 			try:
-				self.expTime = self.spectrometer.getExposureTime() * 1e-3
+				self.hardwareLock.acquire()
+				expTime = self.spectrometer.getExposureTime() * 1e-3
 			except Exception, e:
 				self.error_stream('Error reading device')
 				self.set_state(PyTango.DevState.FAULT)
+			finally:
+				self.hardwareLock.release()
 			time.sleep(0.5)
 
 
 	def onHandler(self, prevState):
 		self.info_stream('Entering onHandler')
 		self.set_status('Connected to spectrometer, acquiring spectra')
+		handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM]
 		self.openSpectrometer()
 		if self.updateTime > self.expTime:
 			self.sleepTime = (self.updateTime - self.expTime) * 1e-3
@@ -306,26 +311,30 @@ class SPM002_DS(PyTango.Device_4Impl):
 		self.info_stream(s)
 		newSpectrumTimestamp = time.time()
 		oldSpectrumTimestamp = time.time()
+		self.hardwareLock.acquire()
 		self.spectrumData = self.spectrometer.CCD
+		self.hardwareLock.release()
 		nextUpdateTime = time.time()
 		while self.stopStateThreadFlag == False:
-			if self.get_state() != PyTango.DevState.ON:
+			if self.get_state() not in handledStates:
 				break
 
 			# Check if any new commands arrived:
 			self.checkCommands()
 			
 			# Check if we should break this loop and go to a new state handler:
-			if self.get_state() != PyTango.DevState.ON:
+			if self.get_state() not in handledStates:
 				break
 
 			try:
 				t = time.time()
 				if t > nextUpdateTime:
+					self.debug_stream(''.join(("In ", self.get_name(), "::onHandler()... acquire spectrum")))
 					self.hardwareLock.acquire()
 					self.spectrometer.acquireSpectrum()
 					newSpectrum = self.spectrometer.CCD				
 					self.hardwareLock.release()
+					self.debug_stream(''.join(("In ", self.get_name(), "::onHandler()... spectrum done")))
 					newSpectrumTimestamp = time.time()
 					d = np.abs(newSpectrum - self.spectrumData).sum()
 					if d == 0:					
@@ -335,8 +344,18 @@ class SPM002_DS(PyTango.Device_4Impl):
 							self.error_stream('Spectrum not updating. Reconnecting.')
 					else:
 						oldSpectrumTimestamp = newSpectrumTimestamp
+					self.debug_stream(''.join(("In ", self.get_name(), "::onHandler()... copy spectrum")))						
 					self.spectrumData = np.copy(newSpectrum)
+					self.debug_stream(''.join(("In ", self.get_name(), "::onHandler()... calculate parameters")))					
 					self.calculateSpectrumParameters()
+					self.debug_stream(''.join(("In ", self.get_name(), "::onHandler()... done")))
+					self.attrLock.acquire()
+					if self.updateTime > self.expTime:
+						self.sleepTime = (self.updateTime - self.expTime) * 1e-3
+					else:
+						self.sleepTime = self.expTime * 1e-3
+					self.attrLock.release()
+					
 					nextUpdateTime = t + self.sleepTime
 				time.sleep(0.01)
 
@@ -429,7 +448,11 @@ class SPM002_DS(PyTango.Device_4Impl):
 		if self.autoExpose == True:
 			# We will try to keep the max reading at around nomI counts
 			nomI = 2500.0
+			self.debug_stream('lock acquire')
+			self.attrLock.acquire()
 			maxI = np.max(self.spectrumData)
+			self.attrLock.release()
+			self.debug_stream('lock release')
 			# Don't adjust if the intensity is within 10% of nominal	
 			if (nomI / maxI > 1.1) or (nomI / maxI < 0.9): 		
 				newExp = nomI / maxI * self.expTime
@@ -463,14 +486,23 @@ class SPM002_DS(PyTango.Device_4Impl):
 
 	def openSpectrometer(self):
 		# If the device was closed, we open it again
-		if self.spectrometer.deviceHandle == None:
+		self.debug_stream('Entering openSpectrometer')
+		self.hardwareLock.acquire()
+		if self.spectrometer.deviceHandle == None:			
 			try:
 				self.spectrometer.openDeviceSerial(self.Serial)
+				self.debug_stream(''.join(('openSpectrometer: device', str(self.Serial), ' opened')))
 			except Exception, e:
 				self.error_stream(''.join(('Could not open device ', str(self.Serial), str(e))))
 				self.set_state(PyTango.DevState.INIT)
 				self.set_status(''.join(('Could not open device ', str(self.Serial))))
+		self.hardwareLock.release()
 
+
+	def startStateThread(self):
+		if self.stateThread.isAlive():
+			self.stopStateThread()
+		self.stateThread.start()
 
 	def stopStateThread(self):
 		self.info_stream('Stopping thread...')
@@ -478,14 +510,19 @@ class SPM002_DS(PyTango.Device_4Impl):
 		if self.stateThread.isAlive() == True:
 			self.info_stream('It was alive.')
 			self.stateThread.join(3)
+			self.spectrometer.closeDevice()
 		self.info_stream('Now stopped.')
 		self.stopStateThreadFlag = False
 		self.set_state(PyTango.DevState.UNKNOWN)
 
 
 	def calculateSpectrumParameters(self):
-		if self.spectrumData != None:
-			sp = self.spectrumData
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
+		sp = np.copy(self.spectrumData)
+		self.attrLock.release()
+		self.debug_stream('lock release')
+		if sp.size != 1:
 			# Start by median filtering to remove spikes
 			m = np.median(np.vstack((sp[6:], sp[5:-1], sp[4:-2], sp[3:-3], sp[2:-4], sp[1:-5], sp[0:-6])), axis=0)
 			noiseFloor = np.mean(m[0:10])
@@ -502,11 +539,15 @@ class SPM002_DS(PyTango.Device_4Impl):
  			peakEdge = peakDist.argmin()
  			# The peak is then located between [peakEdge - 1] and [peakEdge + 1]: 
  			peakData = sp[noiseInd[peakEdge - 1]:noiseInd[peakEdge + 1]]
+ 			
+ 			self.debug_stream('lock acquire')
+ 			self.attrLock.acquire()
  			peakWavelengths = self.wavelengths[noiseInd[peakEdge - 1]:noiseInd[peakEdge + 1]]
-
  			self.peakEnergy = 1560 * 1e-6 * np.trapz(peakData, peakWavelengths) / self.expTime  # Integrate total intensity 			
 			self.spectrumFWHM = np.abs(np.diff(self.wavelengths[halfIndReduced]))
 			self.spectrumCenter = self.wavelengths[peakInd]
+			self.attrLock.release()
+			self.debug_stream('lock release')
 			
 			self.info_stream(''.join(('In calculateSpectrumParameters: PeakEnergy = ', str(self.peakEnergy))))
 			
@@ -521,9 +562,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 		print "In ", self.get_name(), "::read_AcquisitionRate()"
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_AcquisitionRate_read = self.acqTime
 		attr.set_value(attr_AcquisitionRate_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #------------------------------------------------------------------
@@ -536,7 +580,11 @@ class SPM002_DS(PyTango.Device_4Impl):
 		print "Attribute value = ", data
 
 		# 	Add your own code here
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		self.acqTime = data
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #---- AcquisitionRate attribute State Machine -----------------
@@ -568,9 +616,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 	def read_ExposureTime(self, attr):
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_ExposureTime_read = self.expTime
 		attr.set_value(attr_ExposureTime_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #------------------------------------------------------------------
@@ -590,9 +641,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 	def read_AutoExposure(self, attr):
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_ExposureTime_read = self.autoExpose
 		attr.set_value(attr_ExposureTime_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #------------------------------------------------------------------
@@ -612,9 +666,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 	def read_UpdateTime(self, attr):
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_UpdateTime_read = self.updateTime
 		attr.set_value(attr_UpdateTime_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #------------------------------------------------------------------
@@ -626,11 +683,15 @@ class SPM002_DS(PyTango.Device_4Impl):
 		print "Attribute value = ", data
 
 		# 	Add your own code here
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		self.updateTime = data
+		self.attrLock.release()
+		self.debug_stream('lock release')
 		# If running, restart capture thread with new update time
-		if self.get_state() == PyTango.DevState.ON:
-			self.stopHardwareThread()
-			self.startHardwareThread()
+# 		if self.get_state() == PyTango.DevState.ON:
+# 			self.stopStateThread()
+# 			self.startStateThread()
 
 
 #---- UpdateTime attribute State Machine -----------------
@@ -649,9 +710,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 	def read_PeakWavelength(self, attr):
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_PeakWavelength_read = self.spectrumCenter
 		attr.set_value(attr_PeakWavelength_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #---- PeakWavelength attribute State Machine -----------------
@@ -673,9 +737,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 	def read_SpectrumWidth(self, attr):
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_SpectrumWidth_read = self.spectrumFWHM
 		attr.set_value(attr_SpectrumWidth_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #---- SpectrumWidth attribute State Machine -----------------
@@ -695,12 +762,15 @@ class SPM002_DS(PyTango.Device_4Impl):
 # 	Read PeakEnergy attribute
 #------------------------------------------------------------------
 	def read_PeakEnergy(self, attr):
-		print "In ", self.get_name(), "::read_PeakEnergy()"
+		self.debug_stream(''.join(("In ", self.get_name(), "::read_PeakEnergy()")))
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()		
 		attr_PeakEnergy_read = self.peakEnergy
 		attr.set_value(attr_PeakEnergy_read)
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #---- PeakEnergy attribute State Machine -----------------
@@ -721,9 +791,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 #------------------------------------------------------------------
 	def read_Wavelengths(self, attr):
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_Wavelengths_read = self.wavelengths
 		attr.set_value(attr_Wavelengths_read, self.wavelengths.shape[0])
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #---- Wavelengths attribute State Machine -----------------
@@ -740,11 +813,14 @@ class SPM002_DS(PyTango.Device_4Impl):
 # 	Read Spectrum attribute
 #------------------------------------------------------------------
 	def read_Spectrum(self, attr):
-		
+		self.debug_stream(''.join(("In ", self.get_name(), "::read_Spectrum()")))
 		# 	Add your own code here
-		self.hardwareLock.acquire()
-		attr_Spectrum_read = self.spectrometer.CCD
-		self.hardwareLock.release()
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
+		attr_Spectrum_read = np.copy(self.spectrumData)
+		self.debug_stream('...read_Spectrum finish')
+		self.attrLock.release()
+		self.debug_stream('lock release')
 		attr.set_value(attr_Spectrum_read, attr_Spectrum_read.shape[0])
 
 
@@ -764,9 +840,12 @@ class SPM002_DS(PyTango.Device_4Impl):
 	def read_DeviceList(self, attr):
 		
 		# 	Add your own code here
-		
+		self.debug_stream('lock acquire')
+		self.attrLock.acquire()
 		attr_DeviceList_read = self.spectrometer.serialList
 		attr.set_value(attr_DeviceList_read, attr_DeviceList_read.__len__())
+		self.attrLock.release()
+		self.debug_stream('lock release')
 
 
 #---- DeviceList attribute State Machine -----------------
